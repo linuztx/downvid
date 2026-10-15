@@ -33,6 +33,19 @@ describe('isCookieError', () => {
     expect(isCookieError(ERROR('unable to open database file'))).toBe(true)
   })
 
+  it('识别读不出来的浏览器 Cookie 库（SQLite 报错，issue #53）', () => {
+    // 以下报错均用 DownVid 固定版本的 yt-dlp 对构造的浏览器配置目录实跑得到。
+    // 浏览器那一轮同时传了 --cookies 导出文件，yt-dlp 退出前保存 Cookie 会再读一次库，
+    // 所以同一行出现两次——issue #53 的标题就是这样
+    expect(isCookieError([ERROR('no such table: meta'), ERROR('no such table: meta')].join('\n'))).toBe(true)
+    // Firefox 的 cookies.sqlite 是空库
+    expect(isCookieError(ERROR('no such table: moz_cookies'))).toBe(true)
+    // 找到的 Cookies 文件根本不是 SQLite 库
+    expect(isCookieError(ERROR('file is not a database'))).toBe(true)
+    // 复制时浏览器正在写库，副本残缺
+    expect(isCookieError(ERROR('database disk image is malformed'))).toBe(true)
+  })
+
   it('识别 keyring / keychain 类失败', () => {
     expect(isCookieError(ERROR('Keyring Error: keychain not available'))).toBe(true)
   })
@@ -50,6 +63,11 @@ describe('isCookieError', () => {
     expect(isCookieError(ERROR('[youtube] dQw4w9WgXcQ: Video unavailable'))).toBe(false)
     expect(isCookieError(ERROR('Unsupported URL: https://example.com/x'))).toBe(false)
     expect(isCookieError(ERROR('HTTP Error 429: Too Many Requests'))).toBe(false)
+  })
+
+  it('不把下载时写文件失败的「No such file」当成 cookie 问题', () => {
+    // 下载同样走 runWithCookies：误判会把每个 cookie 来源白白重试一遍，真正的报错被淹没
+    expect(isCookieError(ERROR("unable to open for writing: [Errno 2] No such file or directory: 'D:\\Videos\\clip.mp4.part'"))).toBe(false)
   })
 
   it('非 ERROR 行不参与判定（yt-dlp 会把提示写在其他行）', () => {

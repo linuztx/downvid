@@ -204,6 +204,10 @@ const COOKIE_ERROR_PATTERNS = [
   /keyring|keychain|secretstorage|kwallet/i,
   /unsupported (?:browser|keyring)/i,
   /database is locked|unable to open database/i,
+  // 找到的浏览器 Cookie 库读不出来：空库（`no such table: meta`，issue #53）、不是 SQLite 文件、
+  // 复制时浏览器正在写入而残缺。yt-dlp 只在读取浏览器 Cookie 时用到 SQLite，这类报错不可能
+  // 来自视频本身。以前没有这条，于是任何链接都解析失败，而不是退到下一个来源
+  /no such table|file is not a database|database disk image is malformed/i,
   /netscape format|invalid (?:length|expires)/i,
   // 权限类失败：macOS 上读 Safari 的 cookie 需要「完全磁盘访问」权限，
   // 报错形如 `ERROR: [Errno 1] Operation not permitted: '.../Cookies.binarycookies'`。

@@ -6,6 +6,12 @@
 
 ### 修复
 
+- **浏览器 Cookie 库读不出来时，任何链接都解析失败**（#53）：自动 Cookie 模式下，
+  yt-dlp 找到的浏览器 Cookie 库若是空库、不是 SQLite 文件，或复制时浏览器正在写入，
+  会报 `no such table: meta` / `file is not a database` /
+  `database disk image is malformed`。这类报错未被识别为「Cookie 读取失败」，
+  因而没有退到下一个来源，界面只显示「无法解析该链接」。yt-dlp 只在读取浏览器
+  Cookie 时用到 SQLite，现在一律跳过该浏览器继续尝试，不需要登录的视频照常解析
 - **依赖探测可能挂住几十秒到几分钟**：超时后只杀**直接子进程**，而候选可能是
   shell 脚本或 PyInstaller 启动器，其孙进程仍持有 stdout 管道，`cmd.Run()`
   会一直等 I/O。实测一个 `sleep 300` 的假二进制把 5 秒预算的探测拖成 300 秒；
