@@ -81,7 +81,7 @@ console.log(`扫描 ${issues.length} 条 open Issue${APPLY ? '' : '（预演模�
 
 const plan = []
 for (const issue of issues) {
-  const verdict = classifyIssue(issue.body || '')
+  const verdict = classifyIssue(issue.body || '', issue.title)
   const labels = issue.labels.map((l) => (typeof l === 'string' ? l : l.name))
   const alreadyHandled = labels.some((l) => HANDLED_LABELS.has(l))
 
@@ -131,7 +131,7 @@ for (const item of plan) {
   // 先评论再关闭，顺序反了会让评论出现在关闭之后，用户不容易看到
   if (item.close && !item.skipComment) {
     const issue = issues.find((i) => i.number === item.number)
-    const body = commentFor(classifyIssue(issue.body || ''))
+    const body = commentFor(classifyIssue(issue.body || '', issue.title))
     if (body) {
       await api(`/issues/${item.number}/comments`, {
         method: 'POST',

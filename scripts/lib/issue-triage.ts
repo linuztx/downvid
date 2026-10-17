@@ -3,6 +3,7 @@ import {
   isTemplateOnlyReport,
   isInsufficientInfoReport,
   NO_ISSUE_KINDS,
+  PARSE_MESSAGES,
   type ParseErrorKind,
 } from '../../shared/parse-error'
 
@@ -47,16 +48,22 @@ export interface TriageVerdict {
  * 「这样配 Cookie」——用户的真实问题就是没配 Cookie。若先按「空报告」判，
  * 他收到的会是「你什么都没写」，对他毫无帮助。
  *
- * `body` 用原始 Markdown（含代码块）。`labels` 可选，用于识别模板。
+ * `body` 用原始 Markdown（含代码块）。`title` 可选：用户常把链接直接补在预填的标题
+ * 后面（#79），只看正文就会把这种报告当成空报告关掉。标题只当作「有用户输入」的证据，
+ * **不参与判定错误类别**——标题里一个「登录」不该把报告改判成自助类，
+ * 多传一个标题只能让判定更保守，不能让它多关一条。
  */
-export function classifyIssue(body: string): TriageVerdict {
+export function classifyIssue(body: string, title = ''): TriageVerdict {
   const text = body || ''
   const kind = classifyParseError(text)
+  // 用户在标题里补的内容与正文合在一起，才是这条报告的全部线索
+  const titleExtra = userTitleText(title)
+  const reported = titleExtra ? `${titleExtra}\n${text}` : text
 
   // 正文里有没有「原始报错」——代码块是应用回显 yt-dlp 输出的唯一位置。
   // 有它就说明用户至少拿到了真实错误，值得人工看一眼。
   const hasCodeBlock = /```[\s\S]*?```/.test(text)
-  const hasUrl = /https?:\/\/\S+/.test(text)
+  const hasUrl = /https?:\/\/\S+/.test(reported)
   const hasRawEvidence = hasCodeBlock || hasUrl
 
   // 1) 自助类：用户自己能解决，且没有原始报错可看 → 关闭并给可行动的步骤。
@@ -65,20 +72,37 @@ export function classifyIssue(body: string): TriageVerdict {
     return { close: true, reason: 'self-service', comment: 'selfService', kind }
   }
 
-  // 2) 空报告：正文剥掉应用模板后没有任何用户内容，且不是上面能给出指引的类别
-  if (isTemplateOnlyReport(text)) {
+  // 2) 空报告：正文剥掉应用模板后没有任何用户内容，标题也是预填的原样，
+  //    且不是上面能给出指引的类别
+  if (!titleExtra && isTemplateOnlyReport(text)) {
     return { close: true, reason: 'template-only', comment: 'template', kind }
   }
 
   // 3) 信息不足：从模板**手工**提交但填的是占位垃圾（`dsadsa` / `dadas`）。
   //    模板校验只要求「非空」，所以这样照样能开出来（实测 #60）。
   //    放在空报告之后：两者都是「没有信息」，但成因与回复措辞不同。
-  if (isInsufficientInfoReport(text)) {
+  if (isInsufficientInfoReport(reported)) {
     return { close: true, reason: 'insufficient-info', comment: 'insufficient', kind }
   }
 
   // 4) 其余放行——错关一条真实报告比留一条噪音更糟
   return { close: false, reason: 'ok', comment: 'none', kind }
+}
+
+/**
+ * 标题里**用户自己加**的内容；没有则返回空串。
+ *
+ * 应用预填的标题是 `[Bug] <错误文案>`（见 `safeIssueReport`），模板预填的是
+ * `[Bug] ` / `[解析] ` 这类前缀（`.github/ISSUE_TEMPLATE/*.yml`）。两样都剥掉后
+ * 还剩文字或数字，才是用户写的。前缀只认这几个：不认识的前缀会被当成用户内容，
+ * 那是更保守的方向。
+ */
+function userTitleText(title: string): string {
+  let text = (title || '').replace(/^\s*\[(Bug|Feature|解析|安装)\]/i, '')
+  for (const message of Object.values(PARSE_MESSAGES)) {
+    text = text.split(message).join('')
+  }
+  return /[\p{L}\p{N}]/u.test(text) ? text.trim() : ''
 }
 
 /**

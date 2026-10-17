@@ -111,12 +111,22 @@ export const ISSUE_PLACEHOLDER_STEPS = '请补充不含个人信息的复现步�
 /**
  * 判断一条 Issue 正文是否只是模板、没有任何用户补充。
  *
- * 判据：剥掉**应用自动生成**的固定片段后，剩下的"用户内容"过短。
+ * 判据：剥掉**应用自动生成**的固定片段后，不再剩下任何文字或数字。
  *
  * 关键点：`错误详情` 的代码块**不能**剥掉——那里面是真实的原始报错
  * （`Unsupported URL: https://…`、`Sign in to confirm…`），是这条 Issue
  * 唯一的线索。剥掉它会把 #50 / #52 / #57 这类**有价值的报告**误判成空报告。
  * 而 #58 / #59 那类「一路回车」的报告没有任何代码块，剥完就什么都不剩。
+ *
+ * ## 为什么不按长度设门槛
+ *
+ * 此前的判据是「剩下不足 24 个字符」，两个方向都出过错：
+ *   - 误关：#79 的用户补了一句「抖音视频好像都无法下载」，11 个字、一句完整的描述，
+ *     被判成空报告，关评还说「正文里没有包含任何你的输入」。中文一个字往往就是一个词，
+ *     字符数衡量不了有没有内容。
+ *   - 漏关：`诊断：` 行此前没被剥掉，全靠门槛吸收；两行同时出现（YouTube 报错常见）
+ *     就剩 27 个字符，原样未动的模板反而关不掉。
+ * 所以应用写的东西逐项剥干净，剩下的只要还有字就是用户写的，长短交给人判断。
  */
 export function isTemplateOnlyReport(body: string): boolean {
   let text = body || ''
@@ -124,9 +134,9 @@ export function isTemplateOnlyReport(body: string): boolean {
   text = text.replace(/^#+\s*(问题描述|脱敏诊断|复现步骤|错误详情|环境信息)\s*$/gm, '')
   // 应用生成的复现步骤占位
   text = text.replace(ISSUE_PLACEHOLDER_STEPS, '')
-  // 应用生成的错误类别与版本行
+  // 应用生成的错误类别、版本与诊断行（`诊断：` 行由 parseDiagnostic 追加）
   text = text.replace(/错误类别：[\w-]+/g, '')
-  text = text.replace(/^(ytdlp|runtime|操作系统|用户代理)：.*$/gm, '')
+  text = text.replace(/^(ytdlp|runtime|诊断|操作系统|用户代理)：.*$/gm, '')
   // 应用回显的固定文案（PARSE_MESSAGES 的每一句都是应用自己写的）。
   // 注意：**裸的类别名**（authentication / rate-limit …）也要算模板内容，
   // 否则 `错误类别：authentication` 剥掉前缀后剩下的 `authentication`
@@ -137,9 +147,9 @@ export function isTemplateOnlyReport(body: string): boolean {
   for (const key of Object.keys(PARSE_MESSAGES)) {
     text = text.split(key).join('')
   }
-  // 代码块里的原始报错**保留**——那是用户报告的实质内容
-  const stripped = text.replace(/[\s`*\-:|]/g, '')
-  return stripped.length < 24
+  // 代码块里的原始报错**保留**——那是用户报告的实质内容。
+  // 剩下的只要还有任何文字或数字（不分语种），就是用户写的
+  return !/[\p{L}\p{N}]/u.test(text)
 }
 
 // ===== 「信息不足」检测（手工提交的 Issue）=====

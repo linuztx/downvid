@@ -18,8 +18,9 @@ import { loader } from './lib/load-source.mjs'
 const suite = createSuite('Issue 自动关闭分类')
 const load = loader()
 const { classifyIssue, commentFor } = load('scripts/lib/issue-triage.ts')
+const { safeIssueReport, PARSE_MESSAGES } = load('shared/parse-error.ts')
 
-// ===== 真实 Issue 正文（取自仓库 #50 / #52 / #57 / #58）=====
+// ===== 真实 Issue 正文（取自仓库 #50 / #52 / #57 / #58 / #60 / #78 / #79）=====
 
 /** #58：应用自动生成，用户一路回车，正文里没有任何输入 */
 const ISSUE_58 = `## 问题描述
@@ -129,6 +130,30 @@ _No response_
 - [x] I have read the README and FAQ
 `
 
+/** #78：应用自动生成，标题和正文都原样未动——真实的空报告 */
+const ISSUE_78_TITLE = '[Bug] 无法解析该链接'
+const ISSUE_78 = `## 问题描述
+
+无法解析该链接
+
+## 脱敏诊断
+
+错误类别：unknown
+无法解析该链接
+
+## 复现步骤
+
+请补充不含个人信息的复现步骤。`
+
+/**
+ * #79：同样是应用生成的模板，但用户在复现步骤后补了一句话，并把链接追加在**标题**末尾。
+ * 这条被误关了：正文那句话只有 11 个字，当时按「剥完模板后不足 24 个字符」判成空报告；
+ * 链接在标题里，而分类只看正文。关评还告诉用户「正文里没有包含任何你的输入」。
+ */
+const ISSUE_79_TITLE = '[Bug] 无法解析该链接https://v.douyin.com/QN150vJr9TM'
+const ISSUE_79 = `${ISSUE_78}
+抖音视频好像都无法下载`
+
 // ===== 空报告：必须关 =====
 
 suite.case('应用自动生成的空报告（#58）应被关闭', async (t) => {
@@ -152,6 +177,34 @@ suite.case('空报告只多打几个换行 / 空格仍然算空', async (t) => {
   t.equal(v.close, true, '用户没有实质补充，不应因为多了空白就放行')
 })
 
+suite.case('标题和正文都没动的空报告（#78）应被关闭', async (t) => {
+  // 标题是应用预填的 `[Bug] <错误文案>`，一并传进来不能算成「用户写了东西」
+  const v = classifyIssue(ISSUE_78, ISSUE_78_TITLE)
+  t.equal(v.close, true)
+  t.equal(v.reason, 'template-only')
+})
+
+suite.case('应用原样生成的报告一律算空报告（任意类别 × 诊断行 × 换行符）', async (t) => {
+  // `诊断：` 行也是应用自己写的（parseDiagnostic 追加），此前没被剥掉：两行同时出现时
+  // 剩下 27 个字符，越过了「不足 24 个字符」的门槛。YouTube 报错常常同时带
+  // JS 验证失败与 SABR，这类空报告于是一直留在 open 里
+  const diagnostics = {
+    无诊断: '',
+    JS: '\nERROR: n challenge solving failed',
+    SABR: '\nWARNING: YouTube is forcing SABR streaming',
+    两行: '\nERROR: n challenge solving failed\nWARNING: YouTube is forcing SABR streaming',
+  }
+  for (const kind of Object.keys(PARSE_MESSAGES)) {
+    for (const [name, extra] of Object.entries(diagnostics)) {
+      const report = safeIssueReport(PARSE_MESSAGES[kind], `[[parse-error:${kind}]]\nytdlp：2026.10.10${extra}`)
+      // 网页表单提交上来的正文是 CRLF 换行
+      for (const body of [report.body, report.body.replaceAll('\n', '\r\n')]) {
+        t.equal(classifyIssue(body, report.title).close, true, `${kind} / ${name}：应用原样生成的报告应关闭`)
+      }
+    }
+  }
+})
+
 suite.case('手工提交但填占位垃圾的模板 Issue（#60）应被关闭', async (t) => {
   // 这条不是应用自动生成的，是用户从模板手工提交、把必填项填成 dsadsa/dadas。
   // 模板校验只要求「非空」，所以照样能开出来，正文里没有任何可用信息。
@@ -159,6 +212,10 @@ suite.case('手工提交但填占位垃圾的模板 Issue（#60）应被关闭',
   t.equal(v.close, true, '全是占位文字，无法据此定位问题')
   t.equal(v.reason, 'insufficient-info', '应归类为「信息不足」而不是「只有模板」')
   t.ok(commentFor(v).includes('链接'), '关评要告诉用户该补什么信息')
+  // 真实标题同样是占位文字，一并传进来也不能放行
+  t.equal(classifyIssue(ISSUE_60, '[Bug] dsadsa').close, true, '占位标题不算有效内容')
+  // 反过来，标题本身描述了具体现象（取自 #49 的真实标题）就是有效报告
+  t.equal(classifyIssue(ISSUE_60, '[Bug] B站右上角水印无法去除').close, false, '标题描述了具体现象')
 })
 
 suite.case('下拉框选项（Other）不算用户内容', async (t) => {
@@ -224,6 +281,31 @@ suite.case('简短但有效的报告不能因为短就关掉', async (t) => {
   // 一句话的报告（如「选 1080P 之后卡在 0%」）是有效的，不能按长度一刀切
   const v = classifyIssue('### Issue Description\n\n选 1080P 之后进度一直卡在 0%\n\n### Steps to Reproduce\n\n1. 粘贴链接\n2. 选 1080P\n3. 卡住')
   t.equal(v.close, false, '有具体现象描述就是有效报告')
+})
+
+suite.case('#79：用户补了一句话，不能因为短就当成空报告', async (t) => {
+  // 只看正文：那句话只有 11 个字，但它就是用户的输入。中文一个字往往就是一个词，
+  // 按字符数设门槛（此前是 24）等于把一句完整的描述当成噪音
+  const v = classifyIssue(ISSUE_79)
+  t.equal(v.close, false, '正文里有用户写的内容')
+  t.equal(v.reason, 'ok')
+})
+
+suite.case('#79：链接补在标题里，与写在正文里同等对待', async (t) => {
+  // 用户常把链接直接追加在预填的标题后面；只看正文时它完全不可见
+  t.equal(classifyIssue(ISSUE_78, ISSUE_79_TITLE).close, false, '正文是空模板，但标题里有用户补的链接')
+  t.equal(classifyIssue(ISSUE_79, ISSUE_79_TITLE).close, false, '#79 原样（标题 + 正文）')
+  // 自助类同理：链接是可复现的线索（同 #52 的口径），不该按「配 Cookie 即可」关掉
+  const title = '[Bug] 该视频需要登录或访问权限，请检查 Cookies 设置 https://www.youtube.com/watch?v=8atq1TtMPZM'
+  t.equal(classifyIssue(ISSUE_58, title).close, false, '自助类别，但标题带链接')
+})
+
+suite.case('标题只当作「有输入」的证据，不参与判定错误类别', async (t) => {
+  // 标题是用户随手写的。拿它判类别的话，标题里一个「登录」就会把报告改判成
+  // authentication、按自助类关掉——多传一个标题只能让判定更保守，不能多关一条
+  const v = classifyIssue('## 问题描述\n\n点了下载之后应用直接闪退，重新打开也没有任务记录。', '[Bug] 登录 B 站之后下载就闪退')
+  t.equal(v.kind, 'unknown')
+  t.equal(v.close, false)
 })
 
 suite.case('用户手写的问题描述不会被误判成空报告', async (t) => {
