@@ -97,11 +97,14 @@ jobs:
         id: triage
         run: |
           # 用仓库自己的加载器读分类逻辑，而不是把逻辑复制到 YAML 里。
-          # 正文走文件传递，避免把用户输入拼进 shell（注入 + 引号地狱）。
+          # 正文与标题都走文件传递，避免把用户输入拼进 shell（注入 + 引号地狱）。
+          # 标题也要传：用户常把链接直接补在预填的标题后面，只看正文会把它当成空报告关掉（#79）
           printf '%s' "$ISSUE_BODY" > /tmp/issue-body.txt
-          node scripts/triage-issue.mjs --body-file /tmp/issue-body.txt
+          printf '%s' "$ISSUE_TITLE" > /tmp/issue-title.txt
+          node scripts/triage-issue.mjs --body-file /tmp/issue-body.txt --title-file /tmp/issue-title.txt
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
 
       - name: 关闭并说明原因
         if: steps.triage.outputs.close == 'true'

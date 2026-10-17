@@ -8,7 +8,7 @@
  * 这里复用 `lib/load-source.mjs` 的 TS 转译加载器，拿到的是**同一份**代码。
  *
  * 用法（CI 里这样调用）：
- *   node scripts/triage-issue.mjs --body-file /tmp/issue-body.txt
+ *   node scripts/triage-issue.mjs --body-file /tmp/issue-body.txt --title-file /tmp/issue-title.txt
  *
  * 输出（写到 $GITHUB_OUTPUT，本地运行时直接打印 JSON）：
  *   close=true|false
@@ -35,7 +35,13 @@ function readBody() {
   }
 }
 
-const verdict = classifyIssue(readBody())
+/** 标题可选：用户常把链接直接补在预填的标题后面（#79），不传就只按正文判 */
+function readTitle() {
+  const i = process.argv.indexOf('--title-file')
+  return i !== -1 && process.argv[i + 1] ? fs.readFileSync(process.argv[i + 1], 'utf8') : ''
+}
+
+const verdict = classifyIssue(readBody(), readTitle())
 const comment = commentFor(verdict)
 
 const out = {
