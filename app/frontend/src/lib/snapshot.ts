@@ -16,6 +16,7 @@
  *
  * 正确的做法是：**任务是一次下载的完整快照**，续传只认任务上的字段。
  */
+import { applyQualityDisambiguation } from './filename'
 
 /** 一次下载发起时需要的全部参数（发起时从界面捕获，之后不再变） */
 export interface DownloadSnapshot {
@@ -26,6 +27,10 @@ export interface DownloadSnapshot {
   hasAudio: boolean
   audioTrack?: { formatId: string; language: string; isM3u8?: boolean }
   subtitles: string[]
+  /** 入队时的输出目录：修改设置不能让续传换目录 */
+  outputDir: string
+  /** 已完成清晰度消歧的模板：续传不能丢掉首次下载的 [1080p] 后缀 */
+  filenameTemplate: string
 }
 
 /** 界面当前的选择（会随用户操作变化） */
@@ -35,6 +40,23 @@ export interface CurrentSelection {
   hasAudio: boolean
   audioTrack?: { formatId: string; language: string; isM3u8?: boolean }
   subtitles: string[]
+  outputDir: string
+  /** 用户设置中的原始模板，入队时才补清晰度后缀 */
+  filenameTemplate: string
+  height?: number
+}
+
+/** 入队时固定输出位置与格式；之后清空解析结果或修改设置都不影响断点续传。 */
+export function createDownloadSnapshot(current: CurrentSelection): DownloadSnapshot {
+  return {
+    formatId: current.formatId,
+    directUrl: current.directUrl,
+    hasAudio: current.hasAudio,
+    audioTrack: current.audioTrack ? { ...current.audioTrack } : undefined,
+    subtitles: [...current.subtitles],
+    outputDir: current.outputDir,
+    filenameTemplate: applyQualityDisambiguation(current.filenameTemplate, current.height),
+  }
 }
 
 /**
@@ -58,14 +80,10 @@ export function snapshotForRun(
       hasAudio: task.hasAudio,
       audioTrack: task.audioTrack ? { ...task.audioTrack } : undefined,
       subtitles: [...task.subtitles],
+      outputDir: task.outputDir,
+      filenameTemplate: task.filenameTemplate,
     }
   }
   if (!current) return null
-  return {
-    formatId: current.formatId,
-    directUrl: current.directUrl,
-    hasAudio: current.hasAudio,
-    audioTrack: current.audioTrack ? { ...current.audioTrack } : undefined,
-    subtitles: [...current.subtitles],
-  }
+  return createDownloadSnapshot(current)
 }

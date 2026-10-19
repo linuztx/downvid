@@ -91,8 +91,7 @@ import type {
 } from './types'
 import { detectPlatform, extractUrl, hostOf, platformName } from './url'
 import { findExistingDownload } from './dedupe'
-import { applyQualityDisambiguation } from './filename'
-import { snapshotForRun } from './snapshot'
+import { createDownloadSnapshot, snapshotForRun } from './snapshot'
 import { dayGroup, formatBytes as formatBytesUtil } from './format'
 
 export type ParseState = 'idle' | 'parsing' | 'done' | 'error'
@@ -671,15 +670,17 @@ class AppStore {
       mode: this.mode,
       quality: pick.quality,
       ext: pick.ext,
-      // 把选择**固化到任务上**：暂停后「继续」要用它，而不是读解析面板。
-      // 详见 TaskItem.formatId 的注释（读面板会把续传变成「按当前格式重下」）。
-      formatId: pick.formatId,
-      hasAudio: pick.hasAudio,
-      audioTrack: this.currentTrackSnapshot(),
-      // 直链要固化在任务上：它是几十分钟后过期的 CDN 地址，
-      // 续传时若回去读解析面板，可能已经指向别的视频了
-      directUrl: video.directUrl,
-      subtitles: [...this.subtitles],
+      // 格式与输出位置一起固化：续传 / 重试必须找到首次下载的 .part 文件。
+      ...createDownloadSnapshot({
+        formatId: pick.formatId,
+        hasAudio: pick.hasAudio,
+        audioTrack: this.currentTrackSnapshot(),
+        directUrl: video.directUrl,
+        subtitles: this.subtitles,
+        outputDir: this.settings.downloadDir,
+        filenameTemplate: this.settings.filenameTemplate,
+        height: pick.height,
+      }),
       totalBytes: pick.totalBytes,
       bytesDone: 0,
       progress: 0,
@@ -694,13 +695,12 @@ class AppStore {
     this.tasks = [task, ...this.tasks]
     this.railOpen = true
 
-    await this.launch(task, pick.height)
+    await this.launch(task)
   }
 
   /** 真正发起一次下载（也用于重试） */
-  private async launch(task: TaskItem, height?: number): Promise<void> {
-    // 走 `snapshotForRun`：有任务就用任务的快照，只在首次发起时读界面选择。
-    // 这条规则被 7 条用例钉住（见 lib/snapshot.test.ts）。
+  private async launch(task: TaskItem): Promise<void> {
+    // 只读入队时的快照，不能重新计算输出模板或读取后来修改的下载目录。
     const snap = snapshotForRun(task, null)
     if (!snap) return
     const res = await startDownload({
@@ -716,13 +716,8 @@ class AppStore {
       audioTrack: snap.audioTrack,
       directUrl: task.directUrl,
       title: task.title,
-      outputDir: this.settings.downloadDir,
-      // 有分辨率才让它进文件名。
-      //
-      // 纯音频/直链这类没有高度的格式，`%(height)s` 会渲染成 `NA`，
-      // 产物名就成了 `标题 [NAp].mp4`。这里提前删掉那个占位符，
-      // 比让 yt-dlp 事后回退到 format_id（`[mp4]`）更干净。
-      filenameTemplate: applyQualityDisambiguation(this.settings.filenameTemplate, height),
+      outputDir: snap.outputDir,
+      filenameTemplate: snap.filenameTemplate,
     })
 
     if (!res.ok) {

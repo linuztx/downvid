@@ -14,6 +14,8 @@ const task: DownloadSnapshot = {
   formatId: '137',
   hasAudio: false,
   subtitles: ['zh-Hans'],
+  outputDir: '/downloads/original',
+  filenameTemplate: '%(title)s [1080p].%(ext)s',
 }
 
 // 用户后来在界面上换了选择（另一个视频 / 另一个清晰度）
@@ -21,6 +23,8 @@ const other: CurrentSelection = {
   formatId: '22',
   hasAudio: true,
   subtitles: [],
+  outputDir: '/downloads/changed',
+  filenameTemplate: '%(id)s.%(ext)s',
 }
 
 describe('snapshotForRun', () => {
@@ -42,6 +46,35 @@ describe('snapshotForRun', () => {
     const got = snapshotForRun(null, other)
     expect(got?.formatId).toBe('22')
     expect(got?.hasAudio).toBe(true)
+    expect(got?.outputDir).toBe(other.outputDir)
+    expect(got?.filenameTemplate).toBe(other.filenameTemplate)
+  })
+
+  it('入队时固定清晰度后缀，清空解析面板后续传不改变文件名', () => {
+    const initial = snapshotForRun(null, {
+      ...other,
+      height: 1080,
+      outputDir: '/downloads/original',
+      filenameTemplate: '%(title)s.%(ext)s',
+    })
+    expect(initial?.filenameTemplate).toBe('%(title)s [1080p].%(ext)s')
+
+    // 续传时已经没有解析结果，也不能再依赖 height。
+    const resumed = snapshotForRun(initial, null)
+    expect(resumed?.filenameTemplate).toBe('%(title)s [1080p].%(ext)s')
+    expect(resumed?.outputDir).toBe('/downloads/original')
+  })
+
+  it('入队后修改下载目录、模板或清晰度，重试仍使用原来的输出位置', () => {
+    const initial = snapshotForRun(null, {
+      ...other,
+      height: 2160,
+      outputDir: '/downloads/original',
+      filenameTemplate: '%(title)s.%(ext)s',
+    })
+    const retried = snapshotForRun(initial, { ...other, height: 720 })
+    expect(retried?.outputDir).toBe('/downloads/original')
+    expect(retried?.filenameTemplate).toBe('%(title)s [2160p].%(ext)s')
   })
 
   it('两者都没有时返回 null（调用方据此不发请求）', () => {
@@ -56,7 +89,7 @@ describe('snapshotForRun', () => {
   })
 
   it('任务快照的字幕也是副本（避免与 store 里的数组共享引用）', () => {
-    const t: DownloadSnapshot = { formatId: '1', hasAudio: true, subtitles: ['en'] }
+    const t: DownloadSnapshot = { ...task, formatId: '1', hasAudio: true, subtitles: ['en'] }
     const got = snapshotForRun(t, null)
     t.subtitles.push('ja')
     expect(got?.subtitles).toEqual(['en'])
@@ -64,6 +97,7 @@ describe('snapshotForRun', () => {
 
   it('音轨随任务走（多音轨视频续传不能丢）', () => {
     const t: DownloadSnapshot = {
+      ...task,
       formatId: '140',
       hasAudio: true,
       audioTrack: { formatId: '251-3', language: 'ja', isM3u8: false },
@@ -80,6 +114,7 @@ describe('snapshotForRun', () => {
     // 用户可能已经解析了别的视频 —— 那时会拿着 A 的地址去下 B，
     // 或者用一个早就失效的地址反复失败。
     const t: DownloadSnapshot = {
+      ...task,
       formatId: 'direct', hasAudio: true, subtitles: [],
       directUrl: 'https://cdn.example-cdn.com/a.mp4?sign=1',
     }

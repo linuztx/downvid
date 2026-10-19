@@ -171,6 +171,9 @@ export interface TaskItem {
    */
   directUrl?: string
   subtitles: string[]
+  /** 入队时固定输出目录与最终模板，续传 / 重试必须定位到同一份 .part 文件 */
+  outputDir: string
+  filenameTemplate: string
   /** 最近 24 次采样的速度（画迷你折线用） */
   speedHistory: number[]
   filePath: string
