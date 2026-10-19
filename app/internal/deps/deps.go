@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,10 +108,13 @@ type Manager struct {
 	sidecarPath string
 	managedDir  string
 
-	mu       sync.Mutex
-	cache    *Snapshot
-	cachedAt time.Time
-	inflight *sync.WaitGroup
+	detectMu        sync.Mutex
+	mu              sync.Mutex
+	cache           *Snapshot
+	cachePaths      map[Kind]string
+	cacheGeneration uint64
+	cachedAt        time.Time
+	inflight        *sync.WaitGroup
 	// active 是正在进行的下载（用于取消）
 	active    *exec.Cmd
 	activeCtx context.Context
@@ -136,21 +140,39 @@ var ErrNoSidecar = errors.New("依赖探测程序缺失（downvid-deps 未打包
 
 // Detect 探测所有依赖。
 //
-// force 为 true 时忽略缓存。
-func (m *Manager) Detect(force bool) (*Snapshot, error) {
+// force 为 true 时忽略缓存。手动路径只用于探测，不影响下载安装目录。
+func (m *Manager) Detect(force bool, manualPaths map[Kind]string) (*Snapshot, error) {
 	if m.sidecarPath == "" {
 		return nil, ErrNoSidecar
 	}
 
+	// 复制本次请求的路径：设置变更或并发探测都不能改掉已有缓存的键。
+	paths := make(map[Kind]string)
+	for _, kind := range AllKinds {
+		if path := strings.TrimSpace(manualPaths[kind]); path != "" {
+			paths[kind] = path
+		}
+	}
+
+	// 冷缓存时只跑一次边车；等待中的同路径请求可复用结果，避免重复启动慢依赖。
+	m.detectMu.Lock()
+	defer m.detectMu.Unlock()
+
 	m.mu.Lock()
-	if !force && m.cache != nil && time.Since(m.cachedAt) < cacheTTL {
+	if !force && m.cache != nil && maps.Equal(m.cachePaths, paths) && time.Since(m.cachedAt) < cacheTTL {
 		snap := m.cache
 		m.mu.Unlock()
 		return snap, nil
 	}
+	generation := m.cacheGeneration
 	m.mu.Unlock()
 
 	args := []string{"detect", "--managed-dir", m.managedDir, "--json"}
+	for _, kind := range AllKinds {
+		if path, ok := paths[kind]; ok {
+			args = append(args, "--manual", kind+"="+path)
+		}
+	}
 	out, err := m.runSidecar(90*time.Second, args...)
 	if err != nil {
 		return nil, err
@@ -173,8 +195,12 @@ func (m *Manager) Detect(force bool) (*Snapshot, error) {
 	}
 
 	m.mu.Lock()
-	m.cache = snap
-	m.cachedAt = time.Now()
+	// 安装或设置变更可能在探测期间清缓存；旧探测不能把失效结果重新写回。
+	if m.cacheGeneration == generation {
+		m.cache = snap
+		m.cachePaths = paths
+		m.cachedAt = time.Now()
+	}
 	m.mu.Unlock()
 
 	return snap, nil
@@ -183,7 +209,9 @@ func (m *Manager) Detect(force bool) (*Snapshot, error) {
 // InvalidateCache 清掉探测缓存（下载完成后调，让界面看到新状态）。
 func (m *Manager) InvalidateCache() {
 	m.mu.Lock()
+	m.cacheGeneration++
 	m.cache = nil
+	m.cachePaths = nil
 	m.cachedAt = time.Time{}
 	m.mu.Unlock()
 }

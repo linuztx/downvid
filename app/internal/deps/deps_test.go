@@ -3,6 +3,7 @@ package deps
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -42,7 +43,7 @@ JSON
 `)
 
 	m := NewManager(sidecar, "/tmp/bin")
-	snap, err := m.Detect(false)
+	snap, err := m.Detect(false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,10 +88,10 @@ func TestDetectCachesResult(t *testing.T) {
 	sidecar := fakeSidecar(t, "echo run >> '"+marker+"'\necho '{\"results\":[]}'\n")
 
 	m := NewManager(sidecar, "/tmp/bin")
-	if _, err := m.Detect(false); err != nil {
+	if _, err := m.Detect(false, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Detect(false); err != nil {
+	if _, err := m.Detect(false, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -100,7 +101,7 @@ func TestDetectCachesResult(t *testing.T) {
 	}
 
 	// force 必须真的绕过缓存
-	if _, err := m.Detect(true); err != nil {
+	if _, err := m.Detect(true, nil); err != nil {
 		t.Fatal(err)
 	}
 	data, _ = os.ReadFile(marker)
@@ -109,9 +110,251 @@ func TestDetectCachesResult(t *testing.T) {
 	}
 }
 
+// 路径含空格或等号时仍是一个参数；未知种类和空路径不能传给边车。
+func TestDetectPassesManualPaths(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("DOWNVID_TEST_ARGS", argsFile)
+	sidecar := fakeSidecar(t, `printf '%s\n' "$@" > "$DOWNVID_TEST_ARGS"
+echo '{"results":[]}'
+`)
+
+	m := NewManager(sidecar, "/managed/bin")
+	_, err := m.Detect(false, map[Kind]string{
+		KindYtdlp:   "  /custom tools/yt-dlp=nightly  ",
+		KindFfmpeg:  "/custom tools/ffmpeg",
+		KindFfprobe: "/custom tools/ffprobe",
+		KindAria2:   `C:\Program Files\aria2\aria2c.exe`,
+		"unknown":   "/must/not/pass",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"detect", "--managed-dir", "/managed/bin", "--json",
+		"--manual", "yt-dlp=/custom tools/yt-dlp=nightly",
+		"--manual", "ffmpeg=/custom tools/ffmpeg",
+		"--manual", "ffprobe=/custom tools/ffprobe",
+		"--manual", `aria2=C:\Program Files\aria2\aria2c.exe`,
+	}
+	got := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("手动路径参数错误：got %q，want %q", got, want)
+	}
+
+	// 安装永远只写托管目录，不能沿用探测时的 --manual 参数。
+	if err := m.Install(FetchOptions{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n"); !reflect.DeepEqual(got, []string{"fetch", "--managed-dir", "/managed/bin"}) {
+		t.Fatalf("下载不应写入手动路径：%q", got)
+	}
+}
+
+// 修改或清除手动路径必须立即生效；调用方复用同一个 map 也不能污染缓存。
+func TestDetectCacheFollowsManualPaths(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "runs")
+	t.Setenv("DOWNVID_TEST_RUNS", marker)
+	sidecar := fakeSidecar(t, `echo run >> "$DOWNVID_TEST_RUNS"
+echo '{"results":[]}'
+`)
+	m := NewManager(sidecar, "/managed/bin")
+	paths := map[Kind]string{KindYtdlp: "/custom/first"}
+	check := func(wantRuns int) {
+		t.Helper()
+		if _, err := m.Detect(false, paths); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Count(string(data), "run"); got != wantRuns {
+			t.Fatalf("探测次数 = %d，want %d", got, wantRuns)
+		}
+	}
+	check(1)
+	check(1)
+	paths[KindYtdlp] = "  /custom/first  "
+	paths[KindFfmpeg] = "   "
+	paths["unknown"] = "/ignored"
+	check(1)
+	paths[KindYtdlp] = "/custom/second"
+	check(2)
+	delete(paths, KindYtdlp)
+	check(3)
+	paths = nil
+	check(3)
+}
+
+// 并发解析同一路径时只启动一次边车，避免每个任务都重复执行慢依赖。
+func TestDetectConcurrentCallsShareCache(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "runs")
+	t.Setenv("DOWNVID_TEST_RUNS", marker)
+	sidecar := fakeSidecar(t, `echo run >> "$DOWNVID_TEST_RUNS"
+sleep 0.05
+echo '{"results":[]}'
+`)
+	m := NewManager(sidecar, "/managed/bin")
+	start := make(chan struct{})
+	done := make(chan error, 4)
+	for i := 0; i < cap(done); i++ {
+		go func() {
+			<-start
+			_, err := m.Detect(false, map[Kind]string{KindYtdlp: "/custom/yt-dlp"})
+			done <- err
+		}()
+	}
+	close(start)
+	for i := 0; i < cap(done); i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), "run"); got != 1 {
+		t.Fatalf("并发解析应只探测一次，got %d", got)
+	}
+}
+
+// 新设置等待旧探测结束后，不能复用旧路径的缓存。
+func TestDetectConcurrentPathsKeepMatchingCache(t *testing.T) {
+	dir := t.TempDir()
+	started := filepath.Join(dir, "started")
+	release := filepath.Join(dir, "release")
+	t.Setenv("DOWNVID_TEST_STARTED", started)
+	t.Setenv("DOWNVID_TEST_RELEASE", release)
+	sidecar := fakeSidecar(t, `path=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manual) path="${2#yt-dlp=}"; shift ;;
+  esac
+  shift
+done
+if [ "$path" = "/custom/old" ]; then
+  : > "$DOWNVID_TEST_STARTED"
+  while [ ! -f "$DOWNVID_TEST_RELEASE" ]; do sleep 0.01; done
+fi
+printf '{"results":[{"kind":"yt-dlp","found":true,"path":"%s"}]}\n' "$path"
+`)
+	// 即使用例提前失败，也释放阻塞的夹具进程。
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+	m := NewManager(sidecar, "/managed/bin")
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Detect(false, map[Kind]string{KindYtdlp: "/custom/old"})
+		done <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("旧路径探测未开始")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	paths := map[Kind]string{KindYtdlp: "/custom/new"}
+	newDone := make(chan error, 1)
+	go func() {
+		_, err := m.Detect(false, paths)
+		newDone <- err
+	}()
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("旧路径探测未结束")
+	}
+	select {
+	case err := <-newDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("新路径探测未结束")
+	}
+	snap, err := m.Detect(false, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Results) != 1 || snap.Results[0].Path != "/custom/new" {
+		t.Fatalf("新设置不应命中旧路径：%+v", snap)
+	}
+}
+
+// 安装替换了同一路径上的依赖后，尚未结束的旧探测不能重新填充缓存。
+func TestDetectInvalidationDiscardsInflightResult(t *testing.T) {
+	dir := t.TempDir()
+	started := filepath.Join(dir, "started")
+	release := filepath.Join(dir, "release")
+	t.Setenv("DOWNVID_TEST_STARTED", started)
+	t.Setenv("DOWNVID_TEST_RELEASE", release)
+	sidecar := fakeSidecar(t, `version="new"
+if [ ! -f "$DOWNVID_TEST_STARTED" ]; then
+  : > "$DOWNVID_TEST_STARTED"
+  while [ ! -f "$DOWNVID_TEST_RELEASE" ]; do sleep 0.01; done
+  version="old"
+fi
+printf '{"results":[{"kind":"yt-dlp","found":true,"path":"/managed/yt-dlp","version":"%s"}]}\n' "$version"
+`)
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+	m := NewManager(sidecar, "/managed/bin")
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Detect(false, nil)
+		done <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("旧版本探测未开始")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	m.InvalidateCache()
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("旧版本探测未结束")
+	}
+	snap, err := m.Detect(false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Results) != 1 || snap.Results[0].Version != "new" {
+		t.Fatalf("清缓存后不应命中尚未结束的旧探测：%+v", snap)
+	}
+}
+
 func TestDetectWithoutSidecar(t *testing.T) {
 	m := NewManager("", "/tmp/bin")
-	if _, err := m.Detect(false); err != ErrNoSidecar {
+	if _, err := m.Detect(false, nil); err != ErrNoSidecar {
 		t.Fatalf("缺边车应返回 ErrNoSidecar，got %v", err)
 	}
 	if err := m.Install(FetchOptions{}, nil); err != ErrNoSidecar {
@@ -201,18 +444,18 @@ esac
 `)
 
 	m := NewManager(sidecar, "/tmp/bin")
-	if _, err := m.Detect(false); err != nil {
+	if _, err := m.Detect(false, nil); err != nil {
 		t.Fatal(err)
 	}
 	// 缓存命中：detect 只跑 1 次
-	if _, err := m.Detect(false); err != nil {
+	if _, err := m.Detect(false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Install(FetchOptions{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	// 下载后缓存应被清：detect 会再跑一次
-	if _, err := m.Detect(false); err != nil {
+	if _, err := m.Detect(false, nil); err != nil {
 		t.Fatal(err)
 	}
 

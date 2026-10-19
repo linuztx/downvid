@@ -12,7 +12,6 @@ package main
 // （那正是「依赖页说装了、加速页说没装」的来源）。
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,7 +22,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Downvid/downvid/app/internal/changelog"
@@ -69,27 +67,15 @@ type DownloadProgress struct {
 
 // DetectDependencies 探测运行依赖（调 Go 边车）。
 func (a *App) DetectDependencies() []Dependency {
-	sidecar := a.sidecarPath()
-	if sidecar == "" {
-		// 边车没打进包里时如实说明，而不是返回空列表让界面显示「未找到」
-		return []Dependency{
-			{Kind: "yt-dlp", Found: false, Reason: "依赖探测程序缺失（downvid-deps 未打包）"},
-		}
+	statuses := a.DetectDeps(true)
+	result := make([]Dependency, 0, len(statuses))
+	for _, d := range statuses {
+		result = append(result, Dependency{
+			Kind: d.Kind, Found: d.Found, Path: d.Path,
+			Version: d.Version, Source: d.Source, Reason: d.Reason,
+		})
 	}
-
-	out, err := runSidecar(sidecar, "detect", "--managed-dir", a.managedBinDir(), "--json")
-	if err != nil {
-		log.Printf("[downvid] 依赖探测失败：%v", err)
-		return []Dependency{{Kind: "yt-dlp", Found: false, Reason: err.Error()}}
-	}
-
-	var payload struct {
-		Results []Dependency `json:"results"`
-	}
-	if err := json.Unmarshal([]byte(out), &payload); err != nil {
-		return []Dependency{{Kind: "yt-dlp", Found: false, Reason: "探测结果解析失败"}}
-	}
-	return payload.Results
+	return result
 }
 
 // ResolveYtdlp 返回可用的 yt-dlp 路径（找不到时返回空串）。
@@ -112,49 +98,12 @@ func (a *App) ResolveYtdlp() string {
 // 用户点「下载」后要等半分钟才有第一字节，看起来就是「点了没反应」。
 // 现在三处共享同一次探测结果。
 func (a *App) pathOf(kind string) (string, bool) {
-	for _, d := range a.detectCached() {
+	for _, d := range a.DetectDeps(false) {
 		if d.Kind == kind && d.Found && d.Path != "" {
 			return d.Path, true
 		}
 	}
 	return "", false
-}
-
-// depsCache / depsCachedAt 缓存一次探测结果。
-//
-// TTL 与 Go 边车里的 cacheTTL 一致（60 秒）。缓存只用于**下载发起前的路径解析**
-// ——界面上的「检测依赖」按钮走 `DetectDependencies` 的实时探测，
-// 不会被缓存挡住（用户点「重新检测」必须真的重新检测）。
-var (
-	depsCache    []Dependency
-	depsCachedAt time.Time
-	depsCacheMu  sync.Mutex
-)
-
-const depsCacheTTL = 60 * time.Second
-
-// detectCached 取最近一次探测结果，超过 TTL 才重新探测。
-func (a *App) detectCached() []Dependency {
-	depsCacheMu.Lock()
-	defer depsCacheMu.Unlock()
-
-	if depsCache != nil && time.Since(depsCachedAt) < depsCacheTTL {
-		return depsCache
-	}
-	result := a.DetectDependencies()
-	depsCache = result
-	depsCachedAt = time.Now()
-	return result
-}
-
-// invalidateDepsCache 让下一次解析重新探测。
-//
-// 依赖刚下载完、或用户在设置里改了手动路径时必须调，否则会拿到旧路径。
-func invalidateDepsCache() {
-	depsCacheMu.Lock()
-	depsCache = nil
-	depsCachedAt = time.Time{}
-	depsCacheMu.Unlock()
 }
 
 // buildArgs 把请求翻译成 yt-dlp 参数。
@@ -657,26 +606,6 @@ func (a *App) cookieArgs() []string { return nil }
 // 小工具：os/exec 的 LookPath 包一层，避免主文件再 import 一次。
 func lookPath(name string) (string, error) { return exec.LookPath(name) }
 
-// runSidecar 执行 Go 边车并返回 stdout。
-//
-// **必须有超时**：边车在探测依赖时会真的执行 yt-dlp / ffmpeg，
-// 而 PyInstaller 构建的 yt-dlp 首次启动要 8~12 秒。没有超时的话
-// 一个卡死的二进制会把整个界面拖住（Wails 的绑定调用是同步的）。
-func runSidecar(sidecar string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, sidecar, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return stdout.String(), fmt.Errorf("%v：%s", err, strings.TrimSpace(stderr.String()))
-	}
-	return stdout.String(), nil
-}
-
 // ===== 解析（前端最需要的能力）=====
 
 // Parse 解析一个 URL，返回视频信息（格式列表、音轨、字幕）。
@@ -767,8 +696,7 @@ func (a *App) ParseDump() *parse.VideoInfo {
 // 边车缺失时返回一条「未找到」而不是空数组：空数组会让界面显示
 // 「没有依赖」而不是「探测程序缺失」，两者的排查方向完全不同。
 func (a *App) DetectDeps(force bool) []deps.Status {
-	m := a.depsManager()
-	snap, err := m.Detect(force)
+	snap, err := a.detectDependencies(force)
 	if err != nil {
 		return []deps.Status{{
 			Kind: deps.KindYtdlp, Found: false,
@@ -783,7 +711,7 @@ func (a *App) DetectDeps(force bool) []deps.Status {
 // 分开返回是因为修法不同：缺失要点「下载」，过旧要点「更新」。
 func (a *App) DepsSummary() map[string]any {
 	m := a.depsManager()
-	snap, err := m.Detect(false)
+	snap, err := a.detectDependencies(false)
 	if err != nil {
 		return map[string]any{"error": err.Error()}
 	}
@@ -806,8 +734,8 @@ func (a *App) InstallDeps(opts DepsInstallRequest) StartDownloadResult {
 	go func() {
 		// 装之前先让探测缓存失效：装完的路径与版本都不一样了，
 		// 不清的话下载发起时还会拿旧路径去 spawn
-		invalidateDepsCache()
-		defer invalidateDepsCache()
+		m.InvalidateCache()
+		defer m.InvalidateCache()
 
 		err := m.Install(deps.FetchOptions{
 			Only:    opts.Only,
@@ -861,6 +789,16 @@ func (a *App) depsManager() *deps.Manager {
 		a.deps = deps.NewManager(a.sidecarPath(), filepath.Join(a.dataDir, "runtime", "bin"))
 	}
 	return a.deps
+}
+
+// detectDependencies 让界面与解析、下载共用同一份手动路径及探测缓存。
+// 设置只在壳层读取，依赖管理包无需知道设置的存储方式。
+func (a *App) detectDependencies(force bool) (*deps.Snapshot, error) {
+	st, err := a.settingsStore().Load()
+	if err != nil {
+		return nil, fmt.Errorf("读取运行依赖设置失败：%w", err)
+	}
+	return a.depsManager().Detect(force, st.DepPaths)
 }
 
 // ===== 系统集成（打开文件 / 目录 / 链接 / 磁盘空间）=====
@@ -1113,9 +1051,6 @@ func (a *App) UpdateSettings(patchJSON string) OpenPathResult {
 	// （手动路径 / 代理会影响探测结果）
 	a.syncRuntimeSettings()
 	a.depsManager().InvalidateCache()
-	// 手动路径 / 代理都可能改变探测结果：清掉这里的 60 秒缓存，
-	// 否则用户改完设置后第一次下载仍会用旧路径
-	invalidateDepsCache()
 	return OpenPathResult{OK: true}
 }
 
@@ -1126,9 +1061,6 @@ func (a *App) ResetSettings() OpenPathResult {
 	}
 	a.syncRuntimeSettings()
 	a.depsManager().InvalidateCache()
-	// 手动路径 / 代理都可能改变探测结果：清掉这里的 60 秒缓存，
-	// 否则用户改完设置后第一次下载仍会用旧路径
-	invalidateDepsCache()
 	return OpenPathResult{OK: true}
 }
 
